@@ -1,12 +1,11 @@
-import os, json, base64, hashlib, hmac
+import os, json, base64, hashlib, hmac, urllib.request
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from linebot.v3.messaging import (
     AsyncApiClient, AsyncMessagingApi, Configuration,
     ReplyMessageRequest, TextMessage
 )
-import anthropic, gspread
-from google.oauth2.service_account import Credentials
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,41 +17,64 @@ LINE_TOKEN  = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 CLAUDE      = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 line_config = Configuration(access_token=LINE_TOKEN)
 
-SHEET_SCOPES = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-
-# ── Google Sheets 連線 ────────────────────────────────
-def get_sheet():
-    creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
-    creds = Credentials.from_service_account_info(creds_json, scopes=SHEET_SCOPES)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
-
-def save_record(record: dict):
-    try:
-        sheet = get_sheet()
-        sheet.append_row([
-            record.get("timestamp", ""),
-            record.get("group_id", ""),
-            record.get("sender_id", ""),
-            record.get("source_type", ""),
-            record.get("raw_message", ""),
-            record.get("work_items", ""),
-            record.get("location", ""),
-            record.get("status", ""),
-            record.get("quantity", ""),
-            record.get("issue_description", ""),
-            record.get("confidence", ""),
-        ])
-    except Exception as e:
-        print(f"[SHEET ERROR] {e}")
 
 # ── 驗簽 ──────────────────────────────────────────────
 def validate_signature(body: bytes, signature: str) -> bool:
     h = hmac.new(LINE_SECRET.encode(), body, hashlib.sha256).digest()
     return hmac.compare_digest(base64.b64encode(h).decode(), signature)
+
+
+# ── Notion 儲存 ───────────────────────────────────────
+def save_record(record: dict):
+    try:
+        url = "https://api.notion.com/v1/pages"
+        headers = {
+            "Authorization": f"Bearer {os.environ['NOTION_API_KEY']}",
+            "Content-Type": "application/json",
+            "Notion-Version": "2022-06-28"
+        }
+        payload = {
+            "parent": {"database_id": os.environ["NOTION_DATABASE_ID"]},
+            "properties": {
+                "timestamp": {
+                    "title": [{"text": {"content": record.get("timestamp", "")}}]
+                },
+                "group_id": {
+                    "rich_text": [{"text": {"content": record.get("group_id", "")}}]
+                },
+                "sender_id": {
+                    "rich_text": [{"text": {"content": record.get("sender_id", "")}}]
+                },
+                "raw_message": {
+                    "rich_text": [{"text": {"content": record.get("raw_message", "")[:2000]}}]
+                },
+                "work_items": {
+                    "rich_text": [{"text": {"content": record.get("work_items", "")}}]
+                },
+                "location": {
+                    "rich_text": [{"text": {"content": record.get("location", "")}}]
+                },
+                "status": {
+                    "select": {"name": record.get("status", "in_progress")}
+                },
+                "quantity": {
+                    "rich_text": [{"text": {"content": str(record.get("quantity", ""))}}]
+                },
+                "issue_description": {
+                    "rich_text": [{"text": {"content": str(record.get("issue_description", ""))}}]
+                },
+                "confidence": {
+                    "number": float(record.get("confidence", 0))
+                },
+            }
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        urllib.request.urlopen(req)
+        print(f"[NOTION SAVED] {record.get('raw_message', '')[:30]}")
+    except Exception as e:
+        print(f"[NOTION ERROR] {e}")
+
 
 # ── Claude 文字分析 ───────────────────────────────────
 def analyze_text(text: str, sender: str, group: str) -> dict:
@@ -86,6 +108,7 @@ def analyze_text(text: str, sender: str, group: str) -> dict:
     except Exception:
         return {"error": "parse_failed"}
 
+
 # ── 背景任務：處理文字訊息 ────────────────────────────
 async def process_text_event(event: dict, reply_token: str):
     text    = event["message"]["text"]
@@ -93,6 +116,7 @@ async def process_text_event(event: dict, reply_token: str):
     group   = event["source"].get("groupId", "direct")
 
     result = analyze_text(text, user_id, group)
+
     if result.get("irrelevant") or result.get("error"):
         return
 
@@ -104,7 +128,7 @@ async def process_text_event(event: dict, reply_token: str):
         "raw_message":       text,
         "work_items":        "、".join(result.get("work_items", [])),
         "location":          result.get("location", ""),
-        "status":            result.get("status", ""),
+        "status":            result.get("status", "in_progress"),
         "quantity":          result.get("quantity", "") or "",
         "issue_description": result.get("issue_description", "") or "",
         "confidence":        result.get("confidence", 0),
@@ -131,6 +155,7 @@ async def process_text_event(event: dict, reply_token: str):
             messages=[TextMessage(text=reply_text)]
         ))
 
+
 # ── Webhook 端點 ──────────────────────────────────────
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
@@ -150,6 +175,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             )
 
     return {"status": "ok"}
+
 
 # ── 健康確認 ──────────────────────────────────────────
 @app.get("/")
